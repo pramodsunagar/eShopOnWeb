@@ -1,0 +1,109 @@
+name: eShopOnWeb CI/CD Multistage Docker Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
+  IMAGE_NAME: eshoponweb/web
+  STAGING_WEBAPP_NAME: eshoponweb-staging
+  PRODUCTION_WEBAPP_NAME: eshoponweb-production
+  RESOURCE_GROUP: rg-eshoponweb
+  LOCATION: eastus
+
+jobs:
+  # Stage 1: Build, Test, and Generate Docker Image
+  build-test-dockerize:
+    name: Build, Test & Dockerize
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    outputs:
+      image-tag: ${{ steps.image-tag.outputs.tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+          dotnet-quality: 'preview'
+
+      - name: Restore dependencies
+        run: dotnet restore ./eShopOnWeb.sln
+
+      - name: Build with dotnet
+        run: dotnet build ./eShopOnWeb.sln --configuration Release --no-restore
+
+      - name: Test with dotnet
+        run: dotnet test ./eShopOnWeb.sln --configuration Release --no-build
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Set image tag output
+        id: image-tag
+        run: echo "tag=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: src/Web/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.run_number }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+  # Stage 2: Deploy Docker image to Staging App Service
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-test-dockerize
+    permissions: {}
+    environment:
+      name: Staging
+      url: https://${{ env.STAGING_WEBAPP_NAME }}.azurewebsites.net
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy Docker image to Staging App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.STAGING_WEBAPP_NAME }}
+          images: ${{ needs.build-test-dockerize.outputs.image-tag }}
+
+  # Stage 3: Deploy Docker image to Production App Service
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-test-dockerize, deploy-staging]
+    permissions: {}
+    environment:
+      name: Production
+      url: https://${{ env.PRODUCTION_WEBAPP_NAME }}.azurewebsites.net
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy Docker image to Production App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.PRODUCTION_WEBAPP_NAME }}
+          images: ${{ needs.build-test-dockerize.outputs.image-tag }}
